@@ -1,0 +1,4 @@
+PyQt5>=5.15
+spotipy>=2.23
+lrclibapi>=0.3
+requests>=2.28
