@@ -1,9 +1,9 @@
 import math
-from PyQt5.QtWidgets import QWidget, QGraphicsDropShadowEffect
+from PyQt5.QtWidgets import QWidget, QApplication
 from PyQt5.QtCore import Qt, QRectF, QTimer, QPointF
 from PyQt5.QtGui import (
     QPainter, QFont, QColor, QPainterPath, QFontMetrics, QPen,
-    QRadialGradient, QLinearGradient, QTransform,
+    QTransform,
 )
 
 
@@ -27,8 +27,20 @@ class OverlayWindow(QWidget):
         self._drag_pos = None
         self._current_index = -1
         self._no_lyrics = False
+        self._paused = False
         self._line_progress = 0.0
-        self._prev_lit_count = 0
+
+        # Font metrics cache — only recalculate when font settings change
+        self._cached_font = None
+        self._cached_fm = None
+        self._cached_space_w = 0
+        self._cached_font_key = None  # (family, size) tuple
+
+        # Word width cache — only recalculate when line changes
+        self._cached_line_index = -1
+        self._cached_words = []
+        self._cached_word_widths = []
+        self._cached_total_w = 0
 
         self._setup_window()
         self._apply_config()
@@ -48,12 +60,12 @@ class OverlayWindow(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
 
     def _apply_config(self):
-        from PyQt5.QtWidgets import QApplication
         screen = QApplication.primaryScreen().geometry()
 
         w = int(screen.width() * self.cfg["width_percent"] / 100)
         font_size = self.cfg["font_size"]
-        h = font_size * 3 + 30  # enough room for pop scale
+        lines_visible = self.cfg.get("lines_visible", 3)
+        h = int(font_size * 1.8 * lines_visible + 30)
 
         x = self.cfg["position_x"]
         if x < 0:
@@ -68,6 +80,9 @@ class OverlayWindow(QWidget):
             self.setWindowFlags(self.windowFlags() & ~Qt.WindowTransparentForInput)
         self.show()
 
+        # Invalidate font cache on config change
+        self._cached_font_key = None
+
     def update_config(self, config):
         self.cfg = config
         self._apply_config()
@@ -75,15 +90,52 @@ class OverlayWindow(QWidget):
 
     def set_track_info(self, info):
         self._no_lyrics = False
+        self._paused = False
         self._current_index = -1
-        self._prev_lit_count = 0
+        self._cached_line_index = -1
         self.update()
 
     def set_no_lyrics(self):
         self._no_lyrics = True
         self.update()
 
+    def set_paused(self):
+        self._paused = True
+        self.update()
+
+    def set_resumed(self):
+        self._paused = False
+        self.update()
+
+    def _get_font_and_metrics(self):
+        """Return (QFont, QFontMetrics, space_width), cached between frames."""
+        key = (self.cfg["font_family"], self.cfg["font_size"])
+        if key != self._cached_font_key:
+            self._cached_font = QFont(key[0], key[1], QFont.Bold)
+            self._cached_fm = QFontMetrics(self._cached_font)
+            self._cached_space_w = self._cached_fm.horizontalAdvance(" ")
+            self._cached_font_key = key
+            self._cached_line_index = -1  # force word width recalc
+        return self._cached_font, self._cached_fm, self._cached_space_w
+
+    def _get_word_widths(self, line_index, text, fm):
+        """Return (words, widths, total_width), cached when line hasn't changed."""
+        if line_index == self._cached_line_index:
+            return self._cached_words, self._cached_word_widths, self._cached_total_w
+        words = text.split()
+        widths = [fm.horizontalAdvance(w) for w in words]
+        space_w = self._cached_space_w
+        total = sum(widths) + space_w * max(0, len(words) - 1)
+        self._cached_line_index = line_index
+        self._cached_words = words
+        self._cached_word_widths = widths
+        self._cached_total_w = total
+        return words, widths, total
+
     def _on_tick(self):
+        # Don't tick when paused or no lyrics
+        if not self.poller.is_playing:
+            return
         if not self.sync.lines or not self.sync.is_synced:
             return
 
@@ -91,7 +143,6 @@ class OverlayWindow(QWidget):
         new_idx = self.sync.get_current_index(pos_ms)
 
         if new_idx != self._current_index:
-            self._prev_lit_count = 0
             self._current_index = new_idx
 
         timestamps = self.sync._timestamps
@@ -109,108 +160,139 @@ class OverlayWindow(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.TextAntialiasing)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform)
 
         r = QRectF(self.rect())
-
         lines = self.sync.lines
+
         if not lines and not self._no_lyrics:
             painter.end()
             return
-
-        highlight = QColor(self.cfg["highlight_color"])
-        font_family = self.cfg["font_family"]
-        font_size = self.cfg["font_size"]
 
         if self._no_lyrics or self._current_index < 0 or self._current_index >= len(lines):
             painter.end()
             return
 
+        f, fm, space_w = self._get_font_and_metrics()
+        highlight = QColor(self.cfg["highlight_color"])
+        dim_font = QFont(f)
+        dim_font.setWeight(QFont.Normal)
+        dim_fm = QFontMetrics(dim_font)
+
+        lines_visible = self.cfg.get("lines_visible", 3)
+        line_height = int(self.cfg["font_size"] * 1.8)
+
+        # Calculate vertical layout: current line centered, others around it
+        lines_above = (lines_visible - 1) // 2
+        lines_below = lines_visible - 1 - lines_above
+        center_y_base = r.height() / 2
+
+        # Draw surrounding lines (dimmed, no animation)
+        for offset in range(-lines_above, lines_below + 1):
+            idx = self._current_index + offset
+            if idx < 0 or idx >= len(lines):
+                continue
+
+            y_center = center_y_base + offset * line_height
+
+            if offset == 0:
+                # Current line — draw with word animation
+                self._paint_active_line(painter, r, f, fm, space_w, highlight, y_center)
+            else:
+                # Context line — dim, simple text
+                text = lines[idx]
+                if not text.strip():
+                    continue
+                dim_words = text.split()
+                dim_widths = [dim_fm.horizontalAdvance(w) for w in dim_words]
+                dim_space = dim_fm.horizontalAdvance(" ")
+                total = sum(dim_widths) + dim_space * max(0, len(dim_words) - 1)
+                x = (r.width() - total) / 2
+                baseline_y = y_center + dim_fm.ascent() / 2 - dim_fm.descent() / 2
+
+                # Fade more for lines further away
+                dist = abs(offset)
+                alpha = max(0.06, 0.15 - (dist - 1) * 0.04)
+
+                for i, word in enumerate(dim_words):
+                    path = QPainterPath()
+                    path.addText(x, baseline_y, dim_font, word)
+                    # Outline
+                    painter.strokePath(path, QPen(QColor(0, 0, 0, int(120 * alpha / 0.15)), 2.5,
+                                                  Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                    painter.fillPath(path, QColor(255, 255, 255, int(255 * alpha)))
+                    x += dim_widths[i] + dim_space
+
+        painter.end()
+
+    def _paint_active_line(self, painter, r, f, fm, space_w, highlight, center_y):
+        """Paint the current lyric line with word-by-word pop animation."""
+        lines = self.sync.lines
         text = lines[self._current_index]
-        words = text.split()
+        words, word_widths, total_w = self._get_word_widths(self._current_index, text, fm)
         if not words:
-            painter.end()
             return
 
-        f = QFont(font_family, font_size, QFont.Bold)
-        fm = QFontMetrics(f)
-        space_w = fm.horizontalAdvance(" ")
-        word_widths = [fm.horizontalAdvance(w) for w in words]
-        total_w = sum(word_widths) + space_w * (len(words) - 1)
-
         start_x = (r.width() - total_w) / 2
-        center_y = r.height() / 2
+        baseline_y = center_y + fm.ascent() / 2 - fm.descent() / 2
 
         progress = self._line_progress
-        # Word index as float — which word is currently popping
         lit_float = progress * len(words)
 
         x = start_x
         for i, word in enumerate(words):
             word_w = word_widths[i]
-            word_center_x = x + word_w / 2
-            word_center_y = center_y
+            word_cx = x + word_w / 2
+            word_cy = center_y
 
-            # Calculate animation state for this word
-            word_trigger = i  # word lights up when lit_float passes i
-            time_since_trigger = lit_float - word_trigger
+            word_trigger = i
+            time_since = lit_float - word_trigger
 
-            if time_since_trigger < 0:
-                # Not yet reached — dim and small
+            if time_since < 0:
                 scale = 0.75
                 opacity = 0.18
                 color = QColor(255, 255, 255, int(255 * opacity))
                 glow = False
-            elif time_since_trigger < 1.0:
-                # Currently popping in!
-                t = min(time_since_trigger, 1.0)
-                scale = 0.75 + 0.35 * ease_out_back(t)  # overshoot to 1.1 then settle ~1.0
+            elif time_since < 1.0:
+                t = min(time_since, 1.0)
+                scale = 0.75 + 0.35 * ease_out_back(t)
                 opacity = 0.18 + 0.82 * ease_out_cubic(t)
-                # Color transitions from dim to highlight
                 color = QColor(highlight)
                 color.setAlpha(int(255 * opacity))
                 glow = t > 0.1
             else:
-                # Already lit — fully visible, settled
-                fade_back = min((time_since_trigger - 1.0) * 0.5, 1.0)
-                scale = 1.0 + 0.1 * (1 - fade_back)  # subtle settle from 1.1 to 1.0
+                fade_back = min((time_since - 1.0) * 0.5, 1.0)
+                scale = 1.0 + 0.1 * (1 - fade_back)
                 color = QColor(highlight)
-                # Slight dim for older words so current one pops more
                 brightness = max(0.6, 1.0 - fade_back * 0.4)
                 color.setAlpha(int(255 * brightness))
                 glow = fade_back < 0.5
 
             painter.save()
 
-            # Transform: scale around word center
-            painter.translate(word_center_x, word_center_y)
+            painter.translate(word_cx, word_cy)
             painter.scale(scale, scale)
-            painter.translate(-word_center_x, -word_center_y)
+            painter.translate(-word_cx, -word_cy)
 
-            # Build text path
-            baseline_y = center_y + fm.ascent() / 2 - fm.descent() / 2
             word_path = QPainterPath()
             word_path.addText(x, baseline_y, f, word)
 
-            # Glow effect for the actively popping word
-            if glow and time_since_trigger < 2.0:
-                glow_strength = 1.0 - min(time_since_trigger, 2.0) / 2.0
+            # Glow for active word
+            if glow and time_since < 2.0:
+                glow_strength = 1.0 - min(time_since, 2.0) / 2.0
                 glow_color = QColor(highlight)
                 glow_color.setAlpha(int(50 * glow_strength))
                 for radius in [6, 4, 2]:
-                    painter.strokePath(word_path, QPen(glow_color, radius, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                    painter.strokePath(word_path, QPen(glow_color, radius,
+                                                       Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
 
-            # Dark outline for readability
-            painter.strokePath(word_path, QPen(QColor(0, 0, 0, 180), 3.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-
-            # Fill word
+            # Dark outline
+            painter.strokePath(word_path, QPen(QColor(0, 0, 0, 180), 3.5,
+                                               Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            # Fill
             painter.fillPath(word_path, color)
 
             painter.restore()
-
             x += word_w + space_w
-
-        painter.end()
 
     # --- Dragging ---
     def mousePressEvent(self, event):

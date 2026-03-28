@@ -17,7 +17,7 @@ DEFAULTS = {
     "position_x": -1,
     "position_y": 30,
     "lines_visible": 3,
-    "poll_interval_ms": 3000,
+    "poll_interval_ms": 1000,
     "spotify_client_id": "",
     "spotify_client_secret": "",
     "spotify_redirect_uri": "http://127.0.0.1:8888/callback",
