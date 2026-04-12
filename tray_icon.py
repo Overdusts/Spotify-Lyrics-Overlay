@@ -27,9 +27,13 @@ class TrayIcon(QSystemTrayIcon):
 
         menu = QMenu()
 
-        toggle_action = QAction("Show / Hide", menu)
+        toggle_action = QAction("Show / Hide  (Ctrl+Alt+F9)", menu)
         toggle_action.triggered.connect(self._toggle_overlay)
         menu.addAction(toggle_action)
+
+        clickthrough_action = QAction("Toggle Click-Through  (Ctrl+Alt+F10)", menu)
+        clickthrough_action.triggered.connect(self._toggle_clickthrough)
+        menu.addAction(clickthrough_action)
 
         settings_action = QAction("Settings", menu)
         settings_action.triggered.connect(open_settings_cb)
@@ -49,6 +53,12 @@ class TrayIcon(QSystemTrayIcon):
             self.overlay.hide()
         else:
             self.overlay.show()
+
+    def _toggle_clickthrough(self):
+        from config import save_config
+        self.overlay.cfg["click_through"] = not self.overlay.cfg.get("click_through", False)
+        self.overlay.update_config(self.overlay.cfg)
+        save_config(self.overlay.cfg)
 
     def _on_activate(self, reason):
         if reason == QSystemTrayIcon.DoubleClick:
