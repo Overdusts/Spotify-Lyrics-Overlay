@@ -121,9 +121,35 @@ def main():
     poller.playback_resumed.connect(overlay.set_resumed)
     poller.start()
 
+    # Global hotkeys (Windows only)
+    hotkey_listener = None
+    try:
+        from hotkeys import HotkeyListener
+        hotkey_listener = HotkeyListener()
+
+        def toggle_visibility():
+            if overlay.isVisible():
+                overlay.hide()
+            else:
+                overlay.show()
+
+        def toggle_clickthrough():
+            cfg["click_through"] = not cfg.get("click_through", False)
+            overlay.update_config(cfg)
+            save_config(cfg)
+
+        hotkey_listener.toggle_visible.connect(toggle_visibility)
+        hotkey_listener.toggle_clickthrough.connect(toggle_clickthrough)
+        hotkey_listener.start()
+    except Exception:
+        pass  # Not on Windows or hotkey registration failed
+
     exit_code = app.exec_()
     poller.stop()
     poller.wait(2000)
+    if hotkey_listener:
+        hotkey_listener.stop()
+        hotkey_listener.wait(1000)
     sys.exit(exit_code)
 
 

@@ -35,11 +35,22 @@ class SpotifyPoller(QThread):
         return int(self._anchor_progress + elapsed)
 
     def run(self):
+        consecutive_errors = 0
         while self._running:
             try:
                 pb = self.sp.current_playback()
-            except Exception:
-                time.sleep(self.poll_interval)
+                consecutive_errors = 0
+            except Exception as e:
+                consecutive_errors += 1
+                err_str = str(e).lower()
+                # Token expired or unauthorized — spotipy auto-refreshes on next call,
+                # but we need to retry quickly instead of waiting a full poll interval.
+                if "token" in err_str or "401" in err_str or "unauthorized" in err_str:
+                    time.sleep(0.5)
+                else:
+                    # Back off on repeated failures (network issues etc.)
+                    backoff = min(self.poll_interval * consecutive_errors, 10)
+                    time.sleep(backoff)
                 continue
 
             if pb is None or pb.get("item") is None:
