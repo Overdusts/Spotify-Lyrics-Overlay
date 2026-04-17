@@ -24,6 +24,9 @@ class SpotifyPoller(QThread):
     def stop(self):
         self._running = False
 
+    def set_poll_interval(self, ms):
+        self.poll_interval = max(0.3, ms / 1000.0)
+
     @property
     def is_playing(self):
         return self._is_playing
