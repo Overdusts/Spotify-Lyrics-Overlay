@@ -59,6 +59,9 @@ class TrayIcon(QSystemTrayIcon):
         self.overlay.cfg["click_through"] = not self.overlay.cfg.get("click_through", False)
         self.overlay.update_config(self.overlay.cfg)
         save_config(self.overlay.cfg)
+        state_msg = "Click-through ON" if self.overlay.cfg["click_through"] else "Click-through OFF"
+        if hasattr(self.overlay, 'show_status'):
+            self.overlay.show_status(state_msg)
 
     def _on_activate(self, reason):
         if reason == QSystemTrayIcon.DoubleClick:

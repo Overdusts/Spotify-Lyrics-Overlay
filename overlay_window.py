@@ -1,9 +1,9 @@
 import time
+import math
 from PyQt5.QtWidgets import QWidget, QApplication
 from PyQt5.QtCore import Qt, QRectF, QTimer
 from PyQt5.QtGui import (
     QPainter, QFont, QColor, QPainterPath, QFontMetrics, QPen,
-    QLinearGradient,
 )
 
 
@@ -17,8 +17,12 @@ def ease_out_back(t):
     return 1 + c3 * pow(t - 1, 3) + c1 * pow(t - 1, 2)
 
 
-def lerp(a, b, t):
-    return a + (b - a) * t
+class OverlayState:
+    IDLE = "idle"           # no song playing
+    LOADING = "loading"     # fetching lyrics
+    LYRICS = "lyrics"       # showing lyrics
+    INSTRUMENTAL = "instrumental"
+    NO_LYRICS = "no_lyrics"
 
 
 class OverlayWindow(QWidget):
@@ -29,30 +33,39 @@ class OverlayWindow(QWidget):
         self.sync = sync_engine
         self._drag_pos = None
         self._current_index = -1
-        self._no_lyrics = False
-        self._paused = False
         self._line_progress = 0.0
+        self._state = OverlayState.IDLE
 
-        # Smooth scroll state
-        self._scroll_offset = 0.0      # current animated offset (float line index)
-        self._scroll_target = 0.0      # target offset (integer line index)
+        # Track info (displayed briefly on change)
+        self._track_name = ""
+        self._track_artist = ""
+        self._track_info_shown_at = 0.0
+
+        # Status message (e.g. "Sync offset: +200ms") shown briefly
+        self._status_message = ""
+        self._status_shown_at = 0.0
+
+        # Smooth scroll
+        self._scroll_offset = 0.0
+        self._scroll_target = 0.0
         self._scroll_velocity = 0.0
         self._last_tick_time = time.monotonic()
 
-        # Font metrics cache
-        self._cached_font = None
-        self._cached_dim_font = None
-        self._cached_fm = None
-        self._cached_dim_fm = None
-        self._cached_space_w = 0
-        self._cached_dim_space_w = 0
+        # Caches
         self._cached_font_key = None
+        self._cached_font = None
+        self._cached_fm = None
+        self._cached_space_w = 0
+        self._cached_dim_font = None
+        self._cached_dim_fm = None
+        self._cached_dim_space_w = 0
 
-        # Word width cache for active line
-        self._cached_line_index = -1
-        self._cached_words = []
-        self._cached_word_widths = []
-        self._cached_total_w = 0
+        # Per-line wrap cache — keyed by (line_index, font_key, max_width)
+        self._wrap_cache = {}
+
+        # Dirty tracking — only repaint when needed
+        self._dirty = True
+        self._last_paint_state = None
 
         self._setup_window()
         self._apply_config()
@@ -61,6 +74,7 @@ class OverlayWindow(QWidget):
         self._tick_timer.timeout.connect(self._on_tick)
         self._tick_timer.start(16)
 
+    # --- Window setup ---
     def _setup_window(self):
         self.setWindowFlags(
             Qt.FramelessWindowHint
@@ -72,17 +86,16 @@ class OverlayWindow(QWidget):
 
     def _apply_config(self):
         screen = QApplication.primaryScreen().geometry()
-
         w = int(screen.width() * self.cfg["width_percent"] / 100)
         font_size = self.cfg["font_size"]
         lines_visible = self.cfg.get("lines_visible", 3)
-        h = int(font_size * 2.0 * lines_visible + 40)
+        # Extra height for potential wrap + track info header
+        h = int(font_size * 2.2 * (lines_visible + 1) + 50)
 
         x = self.cfg["position_x"]
         if x < 0:
             x = (screen.width() - w) // 2
         y = self.cfg["position_y"]
-
         self.setGeometry(x, y, w, h)
 
         if self.cfg.get("click_through"):
@@ -92,35 +105,52 @@ class OverlayWindow(QWidget):
         self.show()
 
         self._cached_font_key = None
+        self._wrap_cache.clear()
+        self._dirty = True
 
     def update_config(self, config):
         self.cfg = config
         self._apply_config()
-        self.update()
 
+    # --- State management ---
     def set_track_info(self, info):
-        self._no_lyrics = False
-        self._paused = False
+        self._track_name = info.get("name", "")
+        self._track_artist = info.get("artist", "")
+        self._track_info_shown_at = time.monotonic()
+        self._state = OverlayState.LOADING
         self._current_index = -1
-        self._cached_line_index = -1
         self._scroll_offset = 0.0
         self._scroll_target = 0.0
-        self.update()
+        self._wrap_cache.clear()
+        self._dirty = True
+
+    def set_lyrics_ready(self):
+        self._state = OverlayState.LYRICS
+        self._current_index = 0
+        self._scroll_offset = 0.0
+        self._scroll_target = 0.0
+        self._dirty = True
 
     def set_no_lyrics(self):
-        self._no_lyrics = True
-        self.update()
+        self._state = OverlayState.NO_LYRICS
+        self._dirty = True
 
-    def set_paused(self):
-        self._paused = True
-        self.update()
+    def set_instrumental(self):
+        self._state = OverlayState.INSTRUMENTAL
+        self._dirty = True
 
-    def set_resumed(self):
-        self._paused = False
-        self.update()
+    def set_idle(self):
+        self._state = OverlayState.IDLE
+        self._dirty = True
 
+    def show_status(self, message):
+        """Show a transient status message (sync offset change etc.)."""
+        self._status_message = message
+        self._status_shown_at = time.monotonic()
+        self._dirty = True
+
+    # --- Font caching ---
     def _get_fonts(self):
-        """Return cached fonts and metrics."""
         key = (self.cfg["font_family"], self.cfg["font_size"])
         if key != self._cached_font_key:
             self._cached_font = QFont(key[0], key[1], QFont.Bold)
@@ -130,93 +160,160 @@ class OverlayWindow(QWidget):
             self._cached_dim_fm = QFontMetrics(self._cached_dim_font)
             self._cached_dim_space_w = self._cached_dim_fm.horizontalAdvance(" ")
             self._cached_font_key = key
-            self._cached_line_index = -1
+            self._wrap_cache.clear()
         return (self._cached_font, self._cached_fm, self._cached_space_w,
                 self._cached_dim_font, self._cached_dim_fm, self._cached_dim_space_w)
 
-    def _get_word_widths(self, line_index, text, fm):
-        if line_index == self._cached_line_index:
-            return self._cached_words, self._cached_word_widths, self._cached_total_w
+    def _wrap_line(self, text, fm, space_w, max_width, cache_key):
+        """Wrap a line into rows that fit within max_width. Returns list of list of (word, width)."""
+        if cache_key in self._wrap_cache:
+            return self._wrap_cache[cache_key]
         words = text.split()
-        widths = [fm.horizontalAdvance(w) for w in words]
-        space_w = self._cached_space_w
-        total = sum(widths) + space_w * max(0, len(words) - 1)
-        self._cached_line_index = line_index
-        self._cached_words = words
-        self._cached_word_widths = widths
-        self._cached_total_w = total
-        return words, widths, total
+        if not words:
+            self._wrap_cache[cache_key] = [[]]
+            return [[]]
 
+        rows = []
+        current = []
+        current_w = 0
+        for w in words:
+            ww = fm.horizontalAdvance(w)
+            needed = ww if not current else current_w + space_w + ww
+            if needed > max_width and current:
+                rows.append(current)
+                current = [(w, ww)]
+                current_w = ww
+            else:
+                current.append((w, ww))
+                current_w = needed
+        if current:
+            rows.append(current)
+        self._wrap_cache[cache_key] = rows
+        return rows
+
+    # --- Ticking ---
     def _on_tick(self):
-        now = time.monotonic()
-        dt = min(now - self._last_tick_time, 0.05)  # cap at 50ms
-        self._last_tick_time = now
-
-        if not self.sync.lines or not self.sync.is_synced:
+        if not self.isVisible():
             return
 
-        if self.poller.is_playing:
-            pos_ms = self.poller.get_interpolated_position()
+        now = time.monotonic()
+        dt = min(now - self._last_tick_time, 0.05)
+        self._last_tick_time = now
+
+        need_update = self._dirty
+
+        # Track info header fades after 4 seconds
+        if self._track_info_shown_at > 0:
+            age = now - self._track_info_shown_at
+            if age < 4.5:
+                need_update = True  # animating fade
+
+        # Status message fades after 2 seconds
+        if self._status_shown_at > 0:
+            age = now - self._status_shown_at
+            if age < 2.5:
+                need_update = True
+
+        # Only advance lyrics when playing + have synced lyrics
+        if self._state == OverlayState.LYRICS and self.poller.is_playing and self.sync.is_synced:
+            offset_ms = self.cfg.get("sync_offset_ms", 0)
+            pos_ms = self.poller.get_interpolated_position() + offset_ms
             new_idx = self.sync.get_current_index(pos_ms)
 
             if new_idx != self._current_index:
                 self._current_index = new_idx
                 self._scroll_target = float(new_idx)
+                need_update = True
 
-            timestamps = self.sync._timestamps
-            if new_idx < len(timestamps):
-                line_start = timestamps[new_idx]
-                line_end = timestamps[new_idx + 1] if new_idx + 1 < len(timestamps) else line_start + 4000
+            bounds = self.sync.line_bounds(new_idx)
+            if bounds:
+                line_start, line_end = bounds
                 duration = max(line_end - line_start, 1)
-                self._line_progress = max(0.0, min(1.0, (pos_ms - line_start) / duration))
+                new_progress = max(0.0, min(1.0, (pos_ms - line_start) / duration))
+                if abs(new_progress - self._line_progress) > 0.001:
+                    self._line_progress = new_progress
+                    need_update = True
             else:
                 self._line_progress = 1.0
 
-        # Smooth scroll — spring-damper towards target
+        # Smooth scroll spring
         diff = self._scroll_target - self._scroll_offset
-        if abs(diff) < 0.001:
-            self._scroll_offset = self._scroll_target
-            self._scroll_velocity = 0.0
-        else:
-            # Critically damped spring for snappy but smooth motion
+        if abs(diff) > 0.001 or abs(self._scroll_velocity) > 0.001:
             spring = 25.0
             damping = 10.0
             force = diff * spring - self._scroll_velocity * damping
             self._scroll_velocity += force * dt
             self._scroll_offset += self._scroll_velocity * dt
+            if abs(diff) < 0.001 and abs(self._scroll_velocity) < 0.01:
+                self._scroll_offset = self._scroll_target
+                self._scroll_velocity = 0.0
+            need_update = True
 
-        self.update()
+        if need_update:
+            self._dirty = False
+            self.update()
 
+    # --- Painting ---
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.TextAntialiasing)
 
         r = QRectF(self.rect())
-        lines = self.sync.lines
-
-        if not lines and not self._no_lyrics:
-            painter.end()
-            return
-
-        if self._no_lyrics or self._current_index < 0 or self._current_index >= len(lines):
-            painter.end()
-            return
+        bg_op = self.cfg.get("bg_opacity", 0.0)
+        if bg_op > 0.01:
+            bg = QColor(self.cfg.get("bg_color", "#000000"))
+            bg.setAlphaF(bg_op)
+            painter.setBrush(bg)
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(r, 14, 14)
 
         f, fm, space_w, dim_font, dim_fm, dim_space_w = self._get_fonts()
         highlight = QColor(self.cfg["highlight_color"])
 
+        # Paint track info header (fades in/out)
+        self._paint_track_info(painter, r, dim_font, dim_fm)
+
+        # Paint status message (overlay bottom)
+        self._paint_status(painter, r, dim_font, dim_fm)
+
+        # Paint main content based on state
+        if self._state == OverlayState.IDLE:
+            painter.end()
+            return
+
+        if self._state == OverlayState.LOADING:
+            self._paint_center_message(painter, r, dim_font, dim_fm, "Loading lyrics…",
+                                        pulse=True)
+            painter.end()
+            return
+
+        if self._state == OverlayState.INSTRUMENTAL:
+            self._paint_center_message(painter, r, f, fm, "♪  Instrumental  ♪",
+                                        color=highlight, pulse=True)
+            painter.end()
+            return
+
+        if self._state == OverlayState.NO_LYRICS:
+            self._paint_center_message(painter, r, dim_font, dim_fm,
+                                        "No lyrics available")
+            painter.end()
+            return
+
+        # State: LYRICS
+        lines = self.sync.lines
+        if not lines or self._current_index < 0 or self._current_index >= len(lines):
+            painter.end()
+            return
+
         lines_visible = self.cfg.get("lines_visible", 3)
+        max_line_width_pct = self.cfg.get("max_line_width_percent", 90) / 100.0
+        max_width = r.width() * max_line_width_pct
         line_height = int(self.cfg["font_size"] * 2.0)
 
         center_y_base = r.height() / 2
-
-        # How many extra lines to render for smooth scrolling
-        render_extra = 2
-        half = lines_visible // 2 + render_extra
-
-        # Scroll offset relative to current target
         scroll_frac = self._scroll_offset - self._scroll_target
+        half = lines_visible // 2 + 2
 
         for offset in range(-half, half + 1):
             idx = self._current_index + offset
@@ -227,15 +324,11 @@ class OverlayWindow(QWidget):
             if not text.strip():
                 continue
 
-            # Y position with smooth scroll offset
             visual_offset = offset + scroll_frac
             y_center = center_y_base + visual_offset * line_height
-
-            # Skip if off-screen
             if y_center < -line_height or y_center > r.height() + line_height:
                 continue
 
-            # Fade at edges
             edge_fade = 1.0
             if abs(visual_offset) > half - 1:
                 edge_fade = max(0.0, 1.0 - (abs(visual_offset) - (half - 1)))
@@ -244,148 +337,237 @@ class OverlayWindow(QWidget):
             is_past = (idx < self._current_index)
 
             if is_active:
-                self._paint_karaoke_line(painter, r, f, fm, space_w,
-                                         highlight, y_center, edge_fade)
+                self._paint_karaoke_wrapped(painter, r, f, fm, space_w,
+                                              highlight, y_center, edge_fade,
+                                              max_width, idx, text)
             else:
-                self._paint_context_line(painter, r, dim_font, dim_fm, dim_space_w,
-                                          text, y_center, is_past, highlight, edge_fade, offset)
+                self._paint_context_wrapped(painter, r, dim_font, dim_fm,
+                                             dim_space_w, text, y_center,
+                                             is_past, highlight, edge_fade,
+                                             offset, max_width, idx)
 
         painter.end()
 
-    def _paint_context_line(self, painter, r, font, fm, space_w,
-                             text, center_y, is_past, highlight, edge_fade, offset):
-        """Draw a context line — past lines in faded highlight, future lines dim white."""
-        words = text.split()
-        if not words:
+    def _paint_track_info(self, painter, r, font, fm):
+        """Show track name briefly when song changes."""
+        if not self.cfg.get("show_track_info", True):
             return
-        widths = [fm.horizontalAdvance(w) for w in words]
-        total = sum(widths) + space_w * max(0, len(words) - 1)
-        x = (r.width() - total) / 2
-        baseline_y = center_y + fm.ascent() / 2 - fm.descent() / 2
+        if self._track_info_shown_at <= 0:
+            return
+        age = time.monotonic() - self._track_info_shown_at
+        if age > 4.5:
+            return
+
+        # Fade in (0-0.3s), visible (0.3-3.5s), fade out (3.5-4.5s)
+        if age < 0.3:
+            alpha = age / 0.3
+        elif age < 3.5:
+            alpha = 1.0
+        else:
+            alpha = max(0.0, 1.0 - (age - 3.5) / 1.0)
+
+        label = self._track_name
+        if self._track_artist:
+            label = f"{self._track_name}  ·  {self._track_artist}"
+
+        # Draw at top
+        small = QFont(font)
+        small.setPointSize(max(9, self.cfg["font_size"] - 8))
+        small_fm = QFontMetrics(small)
+        tw = small_fm.horizontalAdvance(label)
+        x = (r.width() - tw) / 2
+        y = 14 + small_fm.ascent()
+
+        path = QPainterPath()
+        path.addText(x, y, small, label)
+        painter.strokePath(path, QPen(QColor(0, 0, 0, int(180 * alpha)), 2.5,
+                                       Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.fillPath(path, QColor(255, 255, 255, int(200 * alpha)))
+
+    def _paint_status(self, painter, r, font, fm):
+        """Show sync offset / other status briefly at bottom."""
+        if self._status_shown_at <= 0:
+            return
+        age = time.monotonic() - self._status_shown_at
+        if age > 2.5:
+            return
+        if age < 0.2:
+            alpha = age / 0.2
+        elif age < 1.8:
+            alpha = 1.0
+        else:
+            alpha = max(0.0, 1.0 - (age - 1.8) / 0.7)
+
+        small = QFont(font)
+        small.setPointSize(max(9, self.cfg["font_size"] - 6))
+        small_fm = QFontMetrics(small)
+        tw = small_fm.horizontalAdvance(self._status_message)
+        x = (r.width() - tw) / 2
+        y = r.height() - 14
+
+        path = QPainterPath()
+        path.addText(x, y, small, self._status_message)
+        painter.strokePath(path, QPen(QColor(0, 0, 0, int(200 * alpha)), 3.0,
+                                       Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        highlight = QColor(self.cfg["highlight_color"])
+        highlight.setAlpha(int(255 * alpha))
+        painter.fillPath(path, highlight)
+
+    def _paint_center_message(self, painter, r, font, fm, text, color=None, pulse=False):
+        """Center a static message in the overlay."""
+        if pulse:
+            phase = (time.monotonic() % 1.5) / 1.5
+            alpha = 0.5 + 0.5 * (0.5 + 0.5 * math.cos(phase * 2 * math.pi))
+            self._dirty = True  # force re-tick for animation
+        else:
+            alpha = 1.0
+
+        tw = fm.horizontalAdvance(text)
+        x = (r.width() - tw) / 2
+        y = r.height() / 2 + fm.ascent() / 2 - fm.descent() / 2
+
+        path = QPainterPath()
+        path.addText(x, y, font, text)
+        painter.strokePath(path, QPen(QColor(0, 0, 0, int(200 * alpha)), 3.0,
+                                       Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        c = color if color else QColor(255, 255, 255)
+        fill = QColor(c)
+        fill.setAlpha(int(220 * alpha))
+        painter.fillPath(path, fill)
+
+    def _paint_context_wrapped(self, painter, r, font, fm, space_w, text, center_y,
+                                 is_past, highlight, edge_fade, offset, max_width, line_idx):
+        """Draw a dim/past line with wrapping."""
+        cache_key = (line_idx, self._cached_font_key, int(max_width), "ctx")
+        rows = self._wrap_line(text, fm, space_w, max_width, cache_key)
+        if not rows:
+            return
+
+        row_h = fm.height()
+        total_h = row_h * len(rows)
 
         dist = abs(offset)
-
         if is_past:
-            # Past lines — faded highlight color (already sung)
             alpha = max(0.08, 0.25 - (dist - 1) * 0.06) * edge_fade
             color = QColor(highlight)
             color.setAlpha(int(255 * alpha))
             outline_alpha = int(100 * alpha / 0.25)
         else:
-            # Future lines — dim white
             alpha = max(0.06, 0.18 - (dist - 1) * 0.04) * edge_fade
             color = QColor(255, 255, 255, int(255 * alpha))
             outline_alpha = int(100 * alpha / 0.18)
-
         outline_color = QColor(0, 0, 0, min(255, outline_alpha))
 
-        for i, word in enumerate(words):
-            path = QPainterPath()
-            path.addText(x, baseline_y, font, word)
-            painter.strokePath(path, QPen(outline_color, 2.0,
-                                          Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-            painter.fillPath(path, color)
-            x += widths[i] + space_w
+        start_y = center_y - total_h / 2 + fm.ascent()
 
-    def _paint_karaoke_line(self, painter, r, f, fm, space_w,
-                             highlight, center_y, edge_fade):
-        """Paint active line with karaoke fill — words fill left to right."""
-        lines = self.sync.lines
-        text = lines[self._current_index]
-        words, word_widths, total_w = self._get_word_widths(self._current_index, text, fm)
-        if not words:
+        for ri, row in enumerate(rows):
+            total_w = sum(w for _, w in row) + space_w * max(0, len(row) - 1)
+            x = (r.width() - total_w) / 2
+            y = start_y + ri * row_h
+            for word, ww in row:
+                path = QPainterPath()
+                path.addText(x, y, font, word)
+                painter.strokePath(path, QPen(outline_color, 2.0,
+                                               Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                painter.fillPath(path, color)
+                x += ww + space_w
+
+    def _paint_karaoke_wrapped(self, painter, r, f, fm, space_w, highlight,
+                                 center_y, edge_fade, max_width, line_idx, text):
+        """Active line with karaoke fill + wrapping."""
+        cache_key = (line_idx, self._cached_font_key, int(max_width), "active")
+        rows = self._wrap_line(text, fm, space_w, max_width, cache_key)
+        if not rows:
             return
 
-        start_x = (r.width() - total_w) / 2
-        baseline_y = center_y + fm.ascent() / 2 - fm.descent() / 2
+        row_h = fm.height()
+        total_h = row_h * len(rows)
+        start_y = center_y - total_h / 2 + fm.ascent()
 
-        progress = self._line_progress
-        n = len(words)
+        # Compute total width across all words, then fill proportion in pixels
+        all_word_widths = [w for row in rows for _, w in row]
+        n_words = len(all_word_widths)
+        if n_words == 0:
+            return
+        total_char_w = sum(all_word_widths)
+        fill_pixel = self._line_progress * total_char_w
 
-        # Calculate cumulative positions for fill boundary
-        word_starts = []
-        pos = 0.0
-        for i in range(n):
-            word_starts.append(pos)
-            pos += word_widths[i] + (space_w if i < n - 1 else 0)
+        word_global_idx = 0
+        cumulative = 0.0
 
-        # Fill position in pixels from start
-        fill_pixel = progress * total_w
+        for ri, row in enumerate(rows):
+            row_w = sum(w for _, w in row) + space_w * max(0, len(row) - 1)
+            x = (r.width() - row_w) / 2
+            y_baseline = start_y + ri * row_h
+            y_center_row = y_baseline - fm.ascent() / 2 + fm.descent() / 2
 
-        x = start_x
-        for i, word in enumerate(words):
-            word_w = word_widths[i]
-            word_cx = x + word_w / 2
-            word_local_start = word_starts[i]
-            word_local_end = word_local_start + word_w
+            for word, word_w in row:
+                word_local_start = cumulative
+                word_local_end = cumulative + word_w
 
-            # How much of this word is filled (0 to 1)
-            if fill_pixel >= word_local_end:
-                word_fill = 1.0
-            elif fill_pixel <= word_local_start:
-                word_fill = 0.0
-            else:
-                word_fill = (fill_pixel - word_local_start) / word_w
+                if fill_pixel >= word_local_end:
+                    word_fill = 1.0
+                elif fill_pixel <= word_local_start:
+                    word_fill = 0.0
+                else:
+                    word_fill = (fill_pixel - word_local_start) / word_w
 
-            # Scale: unfilled words are slightly smaller, filled pop up
-            if word_fill <= 0:
-                scale = 0.85
-            elif word_fill < 1.0:
-                t = ease_out_back(min(word_fill * 2, 1.0))
-                scale = 0.85 + 0.2 * t  # pops to ~1.05 then settles
-            else:
-                scale = 1.0
+                # Scale
+                if word_fill <= 0:
+                    scale = 0.88
+                elif word_fill < 1.0:
+                    t = ease_out_back(min(word_fill * 2, 1.0))
+                    scale = 0.88 + 0.18 * t
+                else:
+                    scale = 1.0
 
-            painter.save()
+                painter.save()
+                word_cx = x + word_w / 2
+                painter.translate(word_cx, y_center_row)
+                painter.scale(scale, scale)
+                painter.translate(-word_cx, -y_center_row)
 
-            # Scale around word center
-            painter.translate(word_cx, center_y)
-            painter.scale(scale, scale)
-            painter.translate(-word_cx, -center_y)
+                path = QPainterPath()
+                path.addText(x, y_baseline, f, word)
 
-            word_path = QPainterPath()
-            word_path.addText(x, baseline_y, f, word)
-
-            # 1) Dark outline for readability
-            painter.strokePath(word_path, QPen(QColor(0, 0, 0, int(180 * edge_fade)), 3.0,
+                # Dark outline
+                painter.strokePath(path, QPen(QColor(0, 0, 0, int(180 * edge_fade)), 3.0,
                                                Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
 
-            if word_fill <= 0:
-                # Unfilled — dim white
-                painter.fillPath(word_path, QColor(255, 255, 255, int(50 * edge_fade)))
-            elif word_fill >= 1.0:
-                # Fully filled — bright highlight with subtle glow
-                glow_color = QColor(highlight)
-                glow_color.setAlpha(int(40 * edge_fade))
-                painter.strokePath(word_path, QPen(glow_color, 4,
-                                                    Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-                filled = QColor(highlight)
-                filled.setAlpha(int(255 * edge_fade))
-                painter.fillPath(word_path, filled)
-            else:
-                # Partially filled — clip-based karaoke fill
-                # Draw dim base
-                painter.fillPath(word_path, QColor(255, 255, 255, int(50 * edge_fade)))
+                if word_fill <= 0:
+                    painter.fillPath(path, QColor(255, 255, 255, int(55 * edge_fade)))
+                elif word_fill >= 1.0:
+                    glow = QColor(highlight)
+                    glow.setAlpha(int(40 * edge_fade))
+                    painter.strokePath(path, QPen(glow, 4, Qt.SolidLine,
+                                                   Qt.RoundCap, Qt.RoundJoin))
+                    fill = QColor(highlight)
+                    fill.setAlpha(int(255 * edge_fade))
+                    painter.fillPath(path, fill)
+                else:
+                    # Partial fill
+                    painter.fillPath(path, QColor(255, 255, 255, int(55 * edge_fade)))
+                    clip_x = x + word_w * word_fill
+                    painter.save()
+                    clip_rect = QRectF(x - 6, y_baseline - fm.ascent() - 4,
+                                        clip_x - x + 6, fm.height() + 8)
+                    painter.setClipRect(clip_rect)
+                    glow = QColor(highlight)
+                    glow.setAlpha(int(35 * edge_fade))
+                    painter.strokePath(path, QPen(glow, 4, Qt.SolidLine,
+                                                   Qt.RoundCap, Qt.RoundJoin))
+                    fill = QColor(highlight)
+                    fill.setAlpha(int(255 * edge_fade))
+                    painter.fillPath(path, fill)
+                    painter.restore()
 
-                # Clip to filled portion and draw highlight
-                clip_x = x + word_w * word_fill
-                painter.save()
-                clip_rect = QRectF(x - 5, center_y - fm.height(), clip_x - x + 5, fm.height() * 2)
-                painter.setClipRect(clip_rect)
-
-                # Glow on the fill edge
-                glow_color = QColor(highlight)
-                glow_color.setAlpha(int(35 * edge_fade))
-                painter.strokePath(word_path, QPen(glow_color, 4,
-                                                    Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-
-                filled = QColor(highlight)
-                filled.setAlpha(int(255 * edge_fade))
-                painter.fillPath(word_path, filled)
                 painter.restore()
+                x += word_w + space_w
+                cumulative += word_w
+                word_global_idx += 1
 
-            painter.restore()
-            x += word_w + space_w
+            # Account for spaces between words in width, but karaoke fill skips them
+            # (space doesn't need coloring)
 
     # --- Dragging ---
     def mousePressEvent(self, event):
